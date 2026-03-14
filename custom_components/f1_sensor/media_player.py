@@ -55,6 +55,7 @@ class F1ReplayMediaPlayer(F1AuxEntity, MediaPlayerEntity):
         MediaPlayerEntityFeature.PLAY
         | MediaPlayerEntityFeature.PAUSE
         | MediaPlayerEntityFeature.STOP
+        | MediaPlayerEntityFeature.SEEK
     )
     _attr_icon = "mdi:play-circle"
     _attr_should_poll = False
@@ -122,12 +123,9 @@ class F1ReplayMediaPlayer(F1AuxEntity, MediaPlayerEntity):
             self._unsub_tick()
             self._unsub_tick = None
 
-    def _refresh_from_controller(self) -> None:
-        """Refresh attributes from the replay controller."""
-        state = self._controller.state
-        selected = self._controller.session_manager.selected_session
+    def _resolve_playback_window(self) -> tuple[int, int, int, int]:
+        """Return session start, playback start, duration and position in ms."""
         playback = self._controller.get_playback_status()
-
         session_start_ms = int(playback.get("session_start_ms", 0) or 0)
         playback_start_ms = int(
             playback.get("playback_start_ms", session_start_ms) or 0
@@ -138,9 +136,23 @@ class F1ReplayMediaPlayer(F1AuxEntity, MediaPlayerEntity):
         if duration_ms == 0:
             planned = self._controller.get_planned_playback_details()
             if planned:
-                session_start_ms = planned.get("session_start_ms", session_start_ms)
-                playback_start_ms = planned.get("playback_start_ms", playback_start_ms)
-                duration_ms = planned.get("duration_ms", duration_ms)
+                session_start_ms = int(
+                    planned.get("session_start_ms", session_start_ms) or 0
+                )
+                playback_start_ms = int(
+                    planned.get("playback_start_ms", playback_start_ms) or 0
+                )
+                duration_ms = int(planned.get("duration_ms", duration_ms) or 0)
+
+        return session_start_ms, playback_start_ms, duration_ms, position_ms
+
+    def _refresh_from_controller(self) -> None:
+        """Refresh attributes from the replay controller."""
+        state = self._controller.state
+        selected = self._controller.session_manager.selected_session
+        session_start_ms, playback_start_ms, duration_ms, position_ms = (
+            self._resolve_playback_window()
+        )
 
         total_ms = max(0, duration_ms - playback_start_ms)
         position_ms = max(0, position_ms - playback_start_ms)
@@ -194,6 +206,31 @@ class F1ReplayMediaPlayer(F1AuxEntity, MediaPlayerEntity):
         """Pause replay playback."""
         if self._controller.state == ReplayState.PLAYING:
             await self._controller.async_pause()
+
+    async def async_media_seek(self, position: float) -> None:
+        """Seek replay playback to a relative media position in seconds."""
+        if self._controller.state not in (
+            ReplayState.READY,
+            ReplayState.PLAYING,
+            ReplayState.PAUSED,
+        ):
+            return
+
+        _session_start_ms, playback_start_ms, duration_ms, _position_ms = (
+            self._resolve_playback_window()
+        )
+
+        if duration_ms <= 0:
+            return
+
+        relative_ms = max(0, int(float(position) * 1000))
+        target_ms = playback_start_ms + relative_ms
+        target_ms = max(playback_start_ms, min(target_ms, duration_ms))
+
+        try:
+            await self._controller.async_seek_to_ms(target_ms)
+        except RuntimeError as err:
+            _LOGGER.warning("Replay seek failed: %s", err)
 
     async def async_media_stop(self) -> None:
         """Stop replay playback and reset state."""
